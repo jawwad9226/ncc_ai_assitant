@@ -1,453 +1,841 @@
+"""
+NCC AI Assistant Pro - Enhanced Version
+A comprehensive AI-powered study companion for NCC cadets
+Author: Enhanced by Claude
+Version: 3.0
+"""
+
 import streamlit as st
 import google.generativeai as genai
 import time
 import os
 import json
+import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, Tuple
 import logging
+import sqlite3
+import hashlib
+import plotly.graph_objects as go
+import plotly.express as px
+from pathlib import Path
 
 # Import custom modules
-from utils import (
-    setup_gemini, get_ncc_response, generate_quiz_questions, 
-    parse_quiz_response, export_chat_history, import_chat_history
-)
-from chat_interface import display_chat_interface
-from quiz_interface import display_quiz_interface
-from study_materials import display_study_materials
-from practice_tests import display_practice_tests
+from utils.gemini_client import GeminiClient
+from utils.database import DatabaseManager
+from utils.auth import AuthManager
+from interfaces.chat_interface import ChatInterface
+from interfaces.quiz_interface import QuizInterface
+from interfaces.study_materials import StudyMaterials
+from interfaces.practice_tests import PracticeTests
+from interfaces.progress_tracker import ProgressTracker
+from interfaces.flashcards import FlashcardInterface
+from config.settings import AppConfig
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/ncc_assistant.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-# Set page config must be the first Streamlit command
-st.set_page_config(
-    page_title="NCC AI Assistant Pro",
-    page_icon="🎖️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={
-        'Get Help': 'https://github.com/your-username/ncc-assistant',
-        'Report a bug': 'https://github.com/your-username/ncc-assistant/issues',
-        'About': 'NCC AI Assistant - Your comprehensive study companion'
-    }
-)
-
-# Load environment variables
-load_dotenv()
-
-# Custom CSS for better UI
-def load_custom_css():
-    st.markdown("""
-    <style>
-    .main-header {
-        background: linear-gradient(90deg, #1e3c72 0%, #2a5298 100%);
-        padding: 1rem;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
+class NCCAssistantApp:
+    """Main application class for NCC AI Assistant"""
     
-    .feature-card {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        border-left: 4px solid #2a5298;
-        margin-bottom: 1rem;
-    }
-    
-    .stats-container {
-        display: flex;
-        justify-content: space-around;
-        margin: 1rem 0;
-    }
-    
-    .stat-box {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 1rem;
-        border-radius: 8px;
-        text-align: center;
-        min-width: 120px;
-    }
-    
-    .sidebar-info {
-        background: #f8f9fa;
-        padding: 1rem;
-        border-radius: 8px;
-        border: 1px solid #dee2e6;
-    }
-    
-    .success-message {
-        background: #d4edda;
-        border: 1px solid #c3e6cb;
-        color: #155724;
-        padding: 0.75rem;
-        border-radius: 0.25rem;
-        margin: 1rem 0;
-    }
-    
-    .warning-message {
-        background: #fff3cd;
-        border: 1px solid #ffeaa7;
-        color: #856404;
-        padding: 0.75rem;
-        border-radius: 0.25rem;
-        margin: 1rem 0;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-@st.cache_resource
-def setup_gemini_cached():
-    """Initialize Gemini API with caching"""
-    return setup_gemini()
-
-def initialize_session_state():
-    """Initialize all session state variables with better structure"""
-    defaults = {
-        # Chat state
-        'messages': [{"role": "assistant", "content": "🎖️ Welcome to NCC AI Assistant Pro! I'm here to help you with all aspects of NCC training. How can I assist you today?"}],
-        'chat_sessions': {},
-        'current_session_id': 'default',
+    def __init__(self):
+        self.config = AppConfig()
+        self.setup_directories()
+        self.load_environment()
+        self.setup_page_config()
+        self.initialize_components()
         
-        # Quiz state
-        'quiz_questions': [],
-        'current_question': 0,
-        'user_answers': {},
-        'quiz_submitted': False,
-        'quiz_score': 0,
-        'quiz_completed': False,
-        'quiz_topic': "",
-        'quiz_history': [],
+    def setup_directories(self):
+        """Create necessary directories"""
+        directories = ['logs', 'data', 'exports', 'uploads', 'cache']
+        for directory in directories:
+            Path(directory).mkdir(exist_ok=True)
+    
+    def load_environment(self):
+        """Load environment variables"""
+        load_dotenv()
         
-        # Practice test state
-        'practice_test_active': False,
-        'practice_test_questions': [],
-        'practice_test_answers': {},
-        'practice_test_time_limit': 30,
-        'practice_test_start_time': None,
-        
-        # Study materials state
-        'bookmarks': [],
-        'study_progress': {},
-        'notes': {},
-        
-        # API management
-        'last_api_call': None,
-        'api_call_count': 0,
-        'daily_quota_used': 0,
-        'daily_quota_reset': datetime.now().date(),
-        
-        # User preferences
-        'theme': 'light',
-        'difficulty_level': 'intermediate',
-        'preferred_topics': [],
-        
-        # Statistics
-        'total_questions_answered': 0,
-        'correct_answers': 0,
-        'study_time': 0,
-        'certificates_studied': [],
-    }
-    
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-def check_api_quota():
-    """Enhanced API quota management"""
-    today = datetime.now().date()
-    
-    # Reset daily quota if it's a new day
-    if st.session_state.daily_quota_reset != today:
-        st.session_state.daily_quota_used = 0
-        st.session_state.api_call_count = 0
-        st.session_state.daily_quota_reset = today
-    
-    # Check if quota exceeded (example: 50 calls per day for free tier)
-    daily_limit = 50
-    if st.session_state.daily_quota_used >= daily_limit:
-        return False, f"Daily API limit reached ({daily_limit} calls). Resets at midnight."
-    
-    return True, ""
-
-def display_dashboard():
-    """Display a comprehensive dashboard"""
-    st.markdown('<div class="main-header"><h1>🎖️ NCC AI Assistant Pro</h1><p>Your Complete NCC Study Companion</p></div>', unsafe_allow_html=True)
-    
-    # Statistics row
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.markdown(f"""
-        <div class="stat-box">
-            <h3>{st.session_state.total_questions_answered}</h3>
-            <p>Questions Answered</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        accuracy = (st.session_state.correct_answers / max(st.session_state.total_questions_answered, 1)) * 100
-        st.markdown(f"""
-        <div class="stat-box">
-            <h3>{accuracy:.1f}%</h3>
-            <p>Accuracy Rate</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown(f"""
-        <div class="stat-box">
-            <h3>{len(st.session_state.quiz_history)}</h3>
-            <p>Quizzes Taken</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col4:
-        study_hours = st.session_state.study_time // 3600
-        st.markdown(f"""
-        <div class="stat-box">
-            <h3>{study_hours}h</h3>
-            <p>Study Time</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Recent activity
-    st.subheader("📊 Recent Activity")
-    if st.session_state.quiz_history:
-        recent_quiz = st.session_state.quiz_history[-1]
-        st.info(f"Last quiz: {recent_quiz['topic']} - Score: {recent_quiz['score']:.1f}% on {recent_quiz['date']}")
-    else:
-        st.info("No recent quiz activity. Start a quiz to track your progress!")
-    
-    # Quick actions
-    st.subheader("🚀 Quick Actions")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        if st.button("📚 Start Study Session", use_container_width=True):
-            st.session_state.page = "📚 Study Materials"
-            st.rerun()
-    
-    with col2:
-        if st.button("🎯 Take Quiz", use_container_width=True):
-            st.session_state.page = "🎯 Knowledge Quiz"
-            st.rerun()
-    
-    with col3:
-        if st.button("📝 Practice Test", use_container_width=True):
-            st.session_state.page = "📝 Practice Tests"
-            st.rerun()
-    
-    with col4:
-        if st.button("💬 Ask Assistant", use_container_width=True):
-            st.session_state.page = "💬 Chat Assistant"
-            st.rerun()
-
-def display_settings():
-    """Display user settings and preferences"""
-    st.header("⚙️ Settings & Preferences")
-    
-    # User preferences
-    st.subheader("👤 User Preferences")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        difficulty = st.selectbox(
-            "Difficulty Level",
-            ["beginner", "intermediate", "advanced"],
-            index=["beginner", "intermediate", "advanced"].index(st.session_state.difficulty_level)
+    def setup_page_config(self):
+        """Set up Streamlit page configuration"""
+        st.set_page_config(
+            page_title="NCC AI Assistant Pro",
+            page_icon="🎖️",
+            layout="wide",
+            initial_sidebar_state="expanded",
+            menu_items={
+                'Get Help': 'https://github.com/ncc-assistant/help',
+                'Report a bug': 'https://github.com/ncc-assistant/issues',
+                'About': '# NCC AI Assistant Pro\n\nYour comprehensive NCC study companion with AI-powered features.'
+            }
         )
-        st.session_state.difficulty_level = difficulty
         
-        certificate_focus = st.multiselect(
-            "Certificate Focus",
-            ["A Certificate", "B Certificate", "C Certificate"],
-            default=st.session_state.certificates_studied
-        )
-        st.session_state.certificates_studied = certificate_focus
+    def initialize_components(self):
+        """Initialize application components"""
+        try:
+            # Initialize core components
+            self.db_manager = DatabaseManager()
+            self.auth_manager = AuthManager(self.db_manager)
+            self.gemini_client = GeminiClient()
+            
+            # Initialize interfaces
+            self.chat_interface = ChatInterface(self.gemini_client, self.db_manager)
+            self.quiz_interface = QuizInterface(self.gemini_client, self.db_manager)
+            self.study_materials = StudyMaterials(self.db_manager)
+            self.practice_tests = PracticeTests(self.gemini_client, self.db_manager)
+            self.progress_tracker = ProgressTracker(self.db_manager)
+            self.flashcard_interface = FlashcardInterface(self.gemini_client, self.db_manager)
+            
+            # Initialize session state
+            self.initialize_session_state()
+            
+        except Exception as e:
+            logger.error(f"Error initializing components: {e}")
+            st.error(f"Initialization Error: {e}")
     
-    with col2:
-        preferred_topics = st.multiselect(
-            "Preferred Study Topics",
-            [
-                "Drill Commands", "Map Reading", "First Aid", "Weapon Training",
-                "Leadership", "Military History", "Adventure Activities",
-                "Disaster Management", "Social Service", "Environment"
-            ],
-            default=st.session_state.preferred_topics
-        )
-        st.session_state.preferred_topics = preferred_topics
-    
-    # API Management
-    st.subheader("🔧 API Management")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.metric("Daily API Calls Used", st.session_state.daily_quota_used, delta=f"out of 50")
-    
-    with col2:
-        if st.button("Reset API Counter", type="secondary"):
-            st.session_state.daily_quota_used = 0
-            st.session_state.api_call_count = 0
-            st.success("API counter reset!")
-    
-    # Data Management
-    st.subheader("💾 Data Management")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if st.button("📥 Export Chat History"):
-            chat_data = export_chat_history(st.session_state.messages)
-            st.download_button(
-                "Download Chat History",
-                chat_data,
-                "ncc_chat_history.json",
-                "application/json"
-            )
-    
-    with col2:
-        uploaded_file = st.file_uploader("📤 Import Chat History", type="json")
-        if uploaded_file:
-            imported_messages = import_chat_history(uploaded_file)
-            if imported_messages:
-                st.session_state.messages = imported_messages
-                st.success("Chat history imported successfully!")
-    
-    with col3:
-        if st.button("🗑️ Clear All Data", type="secondary"):
-            if st.checkbox("I understand this will delete all my progress"):
-                initialize_session_state()
-                st.success("All data cleared!")
-
-def main():
-    """Enhanced main application function"""
-    # Load custom CSS
-    load_custom_css()
-    
-    # Initialize session state
-    initialize_session_state()
-    
-    # Setup Gemini model
-    model, model_error = setup_gemini_cached()
-    
-    # Check API quota
-    quota_ok, quota_message = check_api_quota()
-    
-    # Sidebar navigation
-    with st.sidebar:
-        st.title("🧭 Navigation")
+    def initialize_session_state(self):
+        """Initialize session state variables"""
+        defaults = {
+            # User session
+            'user_id': None,
+            'username': None,
+            'is_authenticated': False,
+            
+            # Navigation
+            'current_page': '🏠 Dashboard',
+            'previous_page': None,
+            
+            # Chat state
+            'chat_messages': [],
+            'chat_session_id': None,
+            
+            # Quiz state
+            'current_quiz': None,
+            'quiz_in_progress': False,
+            'quiz_results': [],
+            
+            # Study state
+            'current_study_session': None,
+            'study_time_start': None,
+            'total_study_time': 0,
+            
+            # Flashcards state
+            'current_deck': None,
+            'flashcard_session': None,
+            
+            # Practice test state
+            'practice_test_active': False,
+            'practice_test_data': None,
+            
+            # Settings
+            'theme': 'light',
+            'difficulty_level': 'intermediate',
+            'notifications_enabled': True,
+            'sound_enabled': True,
+            
+            # Performance tracking
+            'daily_goals': {'questions': 10, 'study_time': 30},
+            'achievements': [],
+            'streak_count': 0,
+            
+            # API management
+            'api_calls_today': 0,
+            'last_api_reset': datetime.now().date(),
+        }
         
-        # Navigation options
-        page_options = [
-            "🏠 Dashboard",
-            "💬 Chat Assistant", 
-            "🎯 Knowledge Quiz",
-            "📝 Practice Tests",
-            "📚 Study Materials",
-            "⚙️ Settings"
+        for key, value in defaults.items():
+            if key not in st.session_state:
+                st.session_state[key] = value
+    
+    def load_custom_css(self):
+        """Load custom CSS for enhanced UI"""
+        css = """
+        <style>
+        /* Import Google Fonts */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        
+        /* Global Styles */
+        .main {
+            font-family: 'Inter', sans-serif;
+        }
+        
+        /* Header Styles */
+        .main-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 2rem;
+            border-radius: 15px;
+            color: white;
+            text-align: center;
+            margin-bottom: 2rem;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        .main-header h1 {
+            margin: 0;
+            font-size: 2.5rem;
+            font-weight: 700;
+        }
+        
+        .main-header p {
+            margin: 0.5rem 0 0 0;
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+        
+        /* Card Styles */
+        .feature-card {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            border: 1px solid #e1e5e9;
+            margin-bottom: 1rem;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 30px rgba(0,0,0,0.15);
+        }
+        
+        /* Stats Cards */
+        .stats-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin: 2rem 0;
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 1.5rem;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        
+        .stat-card h3 {
+            margin: 0;
+            font-size: 2rem;
+            font-weight: 700;
+        }
+        
+        .stat-card p {
+            margin: 0.5rem 0 0 0;
+            opacity: 0.9;
+        }
+        
+        /* Progress Bars */
+        .progress-container {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 1rem;
+            margin: 1rem 0;
+        }
+        
+        .progress-bar {
+            background: #e9ecef;
+            border-radius: 10px;
+            height: 8px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+        
+        /* Achievement Badges */
+        .achievement-badge {
+            display: inline-block;
+            background: linear-gradient(135deg, #ffd700 0%, #ffed4a 100%);
+            color: #333;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            margin: 0.25rem;
+            font-size: 0.85rem;
+            font-weight: 600;
+            box-shadow: 0 2px 10px rgba(255, 215, 0, 0.3);
+        }
+        
+        /* Sidebar Styles */
+        .sidebar .sidebar-content {
+            background: #f8f9fa;
+        }
+        
+        /* Button Styles */
+        .stButton > button {
+            border-radius: 8px;
+            border: none;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+        
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        
+        /* Alert Styles */
+        .success-alert {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+            padding: 1rem;
+            border-radius: 8px;
+            margin: 1rem 0;
+        }
+        
+        .warning-alert {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            color: #856404;
+            padding: 1rem;
+            border-radius: 8px;
+            margin: 1rem 0;
+        }
+        
+        .error-alert {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+            padding: 1rem;
+            border-radius: 8px;
+            margin: 1rem 0;
+        }
+        
+        /* Dark Mode Support */
+        @media (prefers-color-scheme: dark) {
+            .feature-card {
+                background: #2d3748;
+                border-color: #4a5568;
+                color: white;
+            }
+        }
+        
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .main-header {
+                padding: 1rem;
+            }
+            
+            .main-header h1 {
+                font-size: 2rem;
+            }
+            
+            .stats-container {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        /* Animation for loading states */
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .loading {
+            animation: pulse 2s infinite;
+        }
+        </style>
+        """
+        st.markdown(css, unsafe_allow_html=True)
+    
+    def render_header(self):
+        """Render application header"""
+        st.markdown("""
+        <div class="main-header">
+            <h1>🎖️ NCC AI Assistant Pro</h1>
+            <p>Your Complete AI-Powered NCC Study Companion</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    def render_sidebar(self):
+        """Render enhanced sidebar"""
+        with st.sidebar:
+            # User authentication section
+            if not st.session_state.is_authenticated:
+                self.render_auth_section()
+            else:
+                self.render_user_section()
+            
+            st.markdown("---")
+            
+            # Navigation
+            self.render_navigation()
+            
+            st.markdown("---")
+            
+            # Quick stats
+            self.render_quick_stats()
+            
+            st.markdown("---")
+            
+            # System status
+            self.render_system_status()
+            
+            st.markdown("---")
+            
+            # Daily tip
+            self.render_daily_tip()
+    
+    def render_auth_section(self):
+        """Render authentication section"""
+        st.subheader("🔐 Login")
+        
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                login_clicked = st.form_submit_button("Login", use_container_width=True)
+            
+            with col2:
+                register_clicked = st.form_submit_button("Register", use_container_width=True)
+        
+        if login_clicked and username and password:
+            if self.auth_manager.authenticate_user(username, password):
+                st.session_state.is_authenticated = True
+                st.session_state.username = username
+                st.session_state.user_id = self.auth_manager.get_user_id(username)
+                st.success("Login successful!")
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+        
+        if register_clicked and username and password:
+            if self.auth_manager.register_user(username, password):
+                st.success("Registration successful! Please login.")
+            else:
+                st.error("Registration failed. Username may already exist.")
+    
+    def render_user_section(self):
+        """Render user section for authenticated users"""
+        st.subheader(f"👋 Welcome, {st.session_state.username}!")
+        
+        # User stats
+        user_stats = self.progress_tracker.get_user_stats(st.session_state.user_id)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Level", user_stats.get('level', 1))
+        with col2:
+            st.metric("XP", user_stats.get('xp', 0))
+        
+        # Progress bar for current level
+        current_xp = user_stats.get('xp', 0)
+        next_level_xp = (user_stats.get('level', 1) * 100)
+        progress = min(current_xp / next_level_xp, 1.0)
+        
+        st.progress(progress)
+        st.caption(f"{current_xp}/{next_level_xp} XP to next level")
+        
+        if st.button("🚪 Logout", use_container_width=True):
+            for key in ['is_authenticated', 'username', 'user_id']:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
+    
+    def render_navigation(self):
+        """Render navigation menu"""
+        st.subheader("🧭 Navigation")
+        
+        pages = [
+            ("🏠", "Dashboard"),
+            ("💬", "Chat Assistant"),
+            ("🎯", "Knowledge Quiz"),
+            ("📚", "Study Materials"),
+            ("📝", "Practice Tests"),
+            ("🎴", "Flashcards"),
+            ("📊", "Progress Tracker"),
+            ("⚙️", "Settings")
         ]
         
-        # Get current page from session state or default
-        if 'page' not in st.session_state:
-            st.session_state.page = "🏠 Dashboard"
+        for icon, page_name in pages:
+            full_page_name = f"{icon} {page_name}"
+            if st.button(full_page_name, use_container_width=True, 
+                        key=f"nav_{page_name.lower().replace(' ', '_')}"):
+                st.session_state.previous_page = st.session_state.current_page
+                st.session_state.current_page = full_page_name
+                st.rerun()
+    
+    def render_quick_stats(self):
+        """Render quick statistics"""
+        st.subheader("📊 Today's Progress")
         
-        current_index = page_options.index(st.session_state.page) if st.session_state.page in page_options else 0
-        
-        page = st.radio(
-            "Choose a section:",
-            page_options,
-            index=current_index,
-            key="nav_radio"
-        )
-        
-        # Update session state
-        st.session_state.page = page
+        if st.session_state.is_authenticated:
+            today_stats = self.progress_tracker.get_daily_stats(st.session_state.user_id)
+            
+            # Questions answered today
+            questions_today = today_stats.get('questions_answered', 0)
+            questions_goal = st.session_state.daily_goals['questions']
+            st.metric("Questions", f"{questions_today}/{questions_goal}")
+            
+            # Study time today
+            study_time = today_stats.get('study_time', 0)
+            study_goal = st.session_state.daily_goals['study_time']
+            st.metric("Study Time", f"{study_time}m/{study_goal}m")
+            
+            # Streak
+            streak = today_stats.get('streak', 0)
+            st.metric("Streak", f"{streak} days", delta=1 if streak > 0 else 0)
+        else:
+            st.info("Login to track your progress!")
+    
+    def render_system_status(self):
+        """Render system status"""
+        st.subheader("🔧 System Status")
         
         # API Status
-        st.markdown("---")
-        st.subheader("📡 API Status")
-        if model:
-            st.success("✅ Connected")
+        if self.gemini_client.is_available():
+            st.success("✅ AI Assistant Online")
         else:
-            st.error("❌ Connection Error")
-            
-        if not quota_ok:
-            st.warning(quota_message)
+            st.error("❌ AI Assistant Offline")
         
-        # Quick stats
-        st.markdown("---")
-        st.subheader("📊 Quick Stats")
-        st.metric("Questions Today", st.session_state.api_call_count)
-        st.metric("Total Study Sessions", len(st.session_state.quiz_history))
+        # Database Status
+        if self.db_manager.is_connected():
+            st.success("✅ Database Connected")
+        else:
+            st.error("❌ Database Error")
         
-        # Tips
-        st.markdown("---")
-        st.subheader("💡 Study Tips")
+        # API Usage
+        api_usage = st.session_state.api_calls_today
+        st.metric("API Calls Today", api_usage)
+    
+    def render_daily_tip(self):
+        """Render daily tip"""
+        st.subheader("💡 Daily Tip")
+        
         tips = [
-            "Review drill commands daily",
-            "Practice map reading regularly", 
-            "Study first aid procedures",
-            "Understand leadership principles",
-            "Learn military terminology"
+            "Practice drill commands daily for muscle memory",
+            "Review map reading skills regularly",
+            "Master first aid basics - they're essential",
+            "Understand leadership principles deeply",
+            "Learn military terminology and abbreviations",
+            "Practice weapon handling safety procedures",
+            "Study NCC history and traditions",
+            "Develop physical fitness consistently",
+            "Learn communication skills and protocols",
+            "Understand disaster management procedures"
         ]
-        tip_of_day = tips[datetime.now().day % len(tips)]
-        st.info(f"💡 {tip_of_day}")
-    
-    # Error handling for model initialization
-    if not model:
-        st.error(f"⚠️ **Setup Required:** {model_error}")
-        st.markdown("""
-        **To get started:**
-        1. Get a free API key from [Google AI Studio](https://ai.google.dev/)
-        2. Create a `.env` file in your project directory
-        3. Add: `GEMINI_API_KEY=your_api_key_here`
-        4. Restart the application
         
-        **Alternative Setup:**
-        - Set the environment variable directly: `export GEMINI_API_KEY=your_key`
-        - Use Streamlit secrets: Add to `.streamlit/secrets.toml`
-        """)
-        return
+        tip_index = datetime.now().day % len(tips)
+        st.info(tips[tip_index])
     
-    # Page routing
-    if page == "🏠 Dashboard":
-        display_dashboard()
-    elif page == "💬 Chat Assistant":
-        display_chat_interface(model, model_error, get_ncc_response, st.session_state)
-    elif page == "🎯 Knowledge Quiz":
-        display_quiz_interface(model, model_error, generate_quiz_questions, parse_quiz_response, st.session_state)
-    elif page == "📝 Practice Tests":
-        display_practice_tests(model, model_error, st.session_state)
-    elif page == "📚 Study Materials":
-        display_study_materials(st.session_state)
-    elif page == "⚙️ Settings":
-        display_settings()
-    
-    # Footer
-    st.markdown("---")
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown("""
-        <div style='text-align: center; color: #666; padding: 1rem;'>
-            <p>🎖️ <strong>NCC AI Assistant Pro</strong> - Made with ❤️ for NCC Cadets</p>
-            <p><small>Version 2.0 | Enhanced with AI-powered features</small></p>
-        </div>
-        """, unsafe_allow_html=True)
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        st.error(f"Application Error: {str(e)}")
-        logger.error(f"Application error: {e}", exc_info=True)
+    def render_dashboard(self):
+        """Render main dashboard"""
+        # Welcome message
+        if st.session_state.is_authenticated:
+            st.markdown(f"## Welcome back, {st.session_state.username}! 👋")
+        else:
+            st.markdown("## Welcome to NCC AI Assistant Pro! 🎖️")
+            st.info("👆 Please login from the sidebar to access all features and track your progress.")
         
-        # Show debug info in development
-        if os.getenv("DEBUG", "false").lower() == "true":
-            st.exception(e)
+        # Quick stats cards
+        if st.session_state.is_authenticated:
+            self.render_dashboard_stats()
+        
+        # Recent activity
+        self.render_recent_activity()
+        
+        # Quick actions
+        self.render_quick_actions()
+        
+        # Featured content
+        self.render_featured_content()
+    
+    def render_dashboard_stats(self):
+        """Render dashboard statistics"""
+        st.markdown("### 📊 Your Progress Overview")
+        
+        user_stats = self.progress_tracker.get_comprehensive_stats(st.session_state.user_id)
+        
+        # Create stats grid
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.markdown("""
+            <div class="stat-card">
+                <h3>{}</h3>
+                <p>Questions Answered</p>
+            </div>
+            """.format(user_stats.get('total_questions', 0)), unsafe_allow_html=True)
+        
+        with col2:
+            accuracy = user_stats.get('accuracy', 0)
+            st.markdown("""
+            <div class="stat-card">
+                <h3>{:.1f}%</h3>
+                <p>Accuracy Rate</p>
+            </div>
+            """.format(accuracy), unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown("""
+            <div class="stat-card">
+                <h3>{}</h3>
+                <p>Quizzes Completed</p>
+            </div>
+            """.format(user_stats.get('quizzes_completed', 0)), unsafe_allow_html=True)
+        
+        with col4:
+            study_hours = user_stats.get('study_time', 0) // 60
+            st.markdown("""
+            <div class="stat-card">
+                <h3>{}h</h3>
+                <p>Total Study Time</p>
+            </div>
+            """.format(study_hours), unsafe_allow_html=True)
+        
+        # Progress chart
+        if user_stats.get('daily_progress'):
+            st.markdown("### 📈 7-Day Progress")
+            self.render_progress_chart(user_stats['daily_progress'])
+    
+    def render_progress_chart(self, daily_data):
+        """Render progress chart"""
+        df = pd.DataFrame(daily_data)
+        
+        fig = px.line(df, x='date', y='questions_answered', 
+                     title='Daily Questions Answered',
+                     markers=True)
+        fig.update_layout(
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    
+    def render_recent_activity(self):
+        """Render recent activity section"""
+        st.markdown("### 📝 Recent Activity")
+        
+        if st.session_state.is_authenticated:
+            activities = self.progress_tracker.get_recent_activities(st.session_state.user_id, limit=5)
+            
+            if activities:
+                for activity in activities:
+                    with st.expander(f"{activity['type']} - {activity['timestamp']}"):
+                        st.write(activity['description'])
+                        if activity.get('score'):
+                            st.metric("Score", f"{activity['score']:.1f}%")
+            else:
+                st.info("No recent activity. Start studying to see your progress here!")
+        else:
+            st.info("Login to see your recent activity.")
+    
+    def render_quick_actions(self):
+        """Render quick action buttons"""
+        st.markdown("### 🚀 Quick Actions")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        actions = [
+            ("📚 Study Now", "📚 Study Materials", "Start a focused study session"),
+            ("🎯 Take Quiz", "🎯 Knowledge Quiz", "Test your knowledge"),
+            ("📝 Practice Test", "📝 Practice Tests", "Full-length practice exam"),
+            ("🎴 Flashcards", "🎴 Flashcards", "Quick review with flashcards")
+        ]
+        
+        for i, (button_text, page, description) in enumerate(actions):
+            with [col1, col2, col3, col4][i]:
+                st.markdown(f"""
+                <div class="feature-card">
+                    <h4>{button_text}</h4>
+                    <p>{description}</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                if st.button(f"Start {button_text.split()[-1]}", 
+                           key=f"quick_action_{i}", 
+                           use_container_width=True):
+                    st.session_state.current_page = page
+                    st.rerun()
+    
+    def render_featured_content(self):
+        """Render featured content section"""
+        st.markdown("### ⭐ Featured Content")
+        
+        # NCC Updates
+        with st.expander("📢 Latest NCC Updates", expanded=True):
+            st.markdown("""
+            - **New Training Modules**: Advanced leadership and communication skills
+            - **Camp Updates**: Summer camp registrations now open
+            - **Certificate Requirements**: Updated guidelines for A, B, C certificates
+            - **Equipment Updates**: New drill procedures and weapon handling protocols
+            """)
+        
+        # Study tips
+        with st.expander("📖 Study Tips & Resources"):
+            st.markdown("""
+            **Effective Study Strategies for NCC:**
+            1. **Daily Practice**: Spend 15-20 minutes daily on drill commands
+            2. **Visual Learning**: Use maps and diagrams for field craft
+            3. **Group Study**: Practice leadership scenarios with peers
+            4. **Regular Testing**: Take quizzes weekly to assess progress
+            5. **Practical Application**: Join camps and outdoor activities
+            """)
+    
+    def route_pages(self):
+        """Handle page routing"""
+        current_page = st.session_state.current_page
+        
+        if current_page == "🏠 Dashboard":
+            self.render_dashboard()
+        elif current_page == "💬 Chat Assistant":
+            self.chat_interface.render()
+        elif current_page == "🎯 Knowledge Quiz":
+            self.quiz_interface.render()
+        elif current_page == "📚 Study Materials":
+            self.study_materials.render()
+        elif current_page == "📝 Practice Tests":
+            self.practice_tests.render()
+        elif current_page == "🎴 Flashcards":
+            self.flashcard_interface.render()
+        elif current_page == "📊 Progress Tracker":
+            self.progress_tracker.render()
+        elif current_page == "⚙️ Settings":
+            self.render_settings()
+        else:
+            self.render_dashboard()
+    
+    def render_settings(self):
+        """Render settings page"""
+        st.header("⚙️ Settings & Preferences")
+        
+        if not st.session_state.is_authenticated:
+            st.warning("Please login to access settings.")
+            return
+        
+        tabs = st.tabs(["👤 Profile", "🎯 Study Preferences", "📊 Progress", "🔧 System", "💾 Data"])
+        
+        with tabs[0]:
+            self.render_profile_settings()
+        
+        with tabs[1]:
+            self.render_study_preferences()
+        
+        with tabs[2]:
+            self.render_progress_settings()
+        
+        with tabs[3]:
+            self.render_system_settings()
+        
+        with tabs[4]:
+            self.render_data_management()
+    
+    def render_profile_settings(self):
+        """Render profile settings"""
+        st.subheader("👤 Profile Settings")
+        
+        # User info form
+        with st.form("profile_form"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                display_name = st.text_input("Display Name", value=st.session_state.username)
+                email = st.text_input("Email", placeholder="your.email@example.com")
+                phone = st.text_input("Phone", placeholder="+91 XXXXX XXXXX")
+            
+            with col2:
+                ncc_unit = st.text_input("NCC Unit", placeholder="e.g., 1 Maharashtra Battalion")
+                certificate_level = st.selectbox("Certificate Level", 
+                                               ["A Certificate", "B Certificate", "C Certificate"])
+                year_of_joining = st.number_input("Year of Joining NCC", 
+                                               min_value=2010, max_value=datetime.now().year)
+            
+            if st.form_submit_button("Update Profile"):
+                profile_data = {
+                    'display_name': display_name,
+                    'email': email,
+                    'phone': phone,
+                    'ncc_unit': ncc_unit,
+                    'certificate_level': certificate_level,
+                    'year_of_joining': year_of_joining
+                }
+                
+                if self.db_manager.update_user_profile(st.session_state.user_id, profile_data):
+                    st.success("Profile updated successfully!")
+                else:
+                    st.error("Failed to update profile.")
+    
+    def render_study_preferences(self):
+        """Render study preferences"""
+        st.subheader("🎯 Study Preferences")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Difficulty Settings**")
+            difficulty = st.select_slider(
+                "Default Difficulty Level",
+                options=["Beginner", "Intermediate", "Advanced"],
+                value=st.session_state.difficulty_level.title()
+            )
+            st.session_state.difficulty_level = difficulty.lower()
+            
+            st.markdown("**Study Goals**")
+            daily_questions = st.number_input("Daily Questions Goal", 
+                                            min_value=1, max_value=50, 
+                                            value=st.session_state.daily_goals['questions'])
+            daily_study_time = st.number_input("Daily Study Time (minutes)", 
+                                             min_value=5, max_value=180, 
+                                             value=st.session_state.daily_goals['study_time'])
+        
+        with col2:
+            st.markdown("**Notification Settings**")
+            notifications = st.checkbox("Enable Notifications", 
+                                      value=st.session_state.notifications_enabled)
+            sound_effects = st.checkbox("Enable Sound Effects", 
+                                      value=st.session_state.sound_enabled)
+            
+            st.markdown("**Focus Areas**")
+            focus_areas = st.multiselect(
+                "Select your focus areas:",
+                ["Drill Commands", "Map Reading", "First Aid", "Weapon Training",
+                 "Leadership", "Military History", "Adventure Activities", 
+                 "Disaster Management", "Social Service", "Environment"],
+                default=["Drill Commands", "First Aid", "Leadership"]
+            )
+        
+        if st.button("Save Preferences"):
+            preferences = {
+                'difficulty_level': difficulty.lower(),
+                'daily_questions_goal': daily_questions,
+                'daily_study_time_goal': daily_study_time,
+                'notifications_enabled': notifications,
+                'sound_enabled': sound_effects,
+                'focus_areas': focus_areas
+            }
+            
+            # Update session state
+            st.session_state.daily_goals = {
+                'questions': daily_questions,
+                'study_time': daily_study_time
+            }
+            st.session_state.notifications_enabled = notifications
+            st.session_state.sound_enabled = sound_effects
+            
+            # Save to database
+            if self.db_manager.update_user_preferences(st.session_state.user_id, preferences):
+                st.success("Preferences saved successfully!")
+            else:
+                st.error("Failed to save preferences.")
+    
+    def render_progress_settings(self):
+        """Render progress settings"""
+        st.subheader("📊 Progress Settings
