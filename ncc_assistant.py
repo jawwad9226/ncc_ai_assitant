@@ -1,385 +1,404 @@
 import streamlit as st
 import google.generativeai as genai
 import time
-import re
-from datetime import datetime, timedelta
 import os
-import random
+import json
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, Tuple
+import logging
+
+# Import custom modules
+from utils import (
+    setup_gemini, get_ncc_response, generate_quiz_questions, 
+    parse_quiz_response, export_chat_history, import_chat_history
+)
 from chat_interface import display_chat_interface
 from quiz_interface import display_quiz_interface
-from utils import get_ncc_response, generate_quiz_questions, parse_quiz_response
+from study_materials import display_study_materials
+from practice_tests import display_practice_tests
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Set page config must be the first Streamlit command
 st.set_page_config(
-    page_title="NCC AI Assistant",
+    page_title="NCC AI Assistant Pro",
     page_icon="🎖️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://github.com/your-username/ncc-assistant',
+        'Report a bug': 'https://github.com/your-username/ncc-assistant/issues',
+        'About': 'NCC AI Assistant - Your comprehensive study companion'
+    }
 )
 
 # Load environment variables
 load_dotenv()
 
-# Configure Gemini
-@st.cache_resource
-def setup_gemini():
-    """Initialize Gemini API with API key from environment variables"""
-    try:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key or api_key == "your_api_key_here":
-            st.error("❌ Please set up your GEMINI_API_KEY in the .env file")
-            st.stop()
-        genai.configure(api_key=api_key)
-        return genai.GenerativeModel('gemini-1.5-flash'), None
-    except Exception as e:
-        st.error(f"❌ Error initializing Gemini API: {str(e)}")
-        return None, str(e)
+# Custom CSS for better UI
+def load_custom_css():
+    st.markdown("""
+    <style>
+    .main-header {
+        background: linear-gradient(90deg, #1e3c72 0%, #2a5298 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    
+    .feature-card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        border-left: 4px solid #2a5298;
+        margin-bottom: 1rem;
+    }
+    
+    .stats-container {
+        display: flex;
+        justify-content: space-around;
+        margin: 1rem 0;
+    }
+    
+    .stat-box {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 1rem;
+        border-radius: 8px;
+        text-align: center;
+        min-width: 120px;
+    }
+    
+    .sidebar-info {
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 8px;
+        border: 1px solid #dee2e6;
+    }
+    
+    .success-message {
+        background: #d4edda;
+        border: 1px solid #c3e6cb;
+        color: #155724;
+        padding: 0.75rem;
+        border-radius: 0.25rem;
+        margin: 1rem 0;
+    }
+    
+    .warning-message {
+        background: #fff3cd;
+        border: 1px solid #ffeaa7;
+        color: #856404;
+        padding: 0.75rem;
+        border-radius: 0.25rem;
+        margin: 1rem 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# Initialize model and error as global variables
-model = None
-model_error = None
+@st.cache_resource
+def setup_gemini_cached():
+    """Initialize Gemini API with caching"""
+    return setup_gemini()
 
 def initialize_session_state():
-    """Initialize all session state variables"""
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    if 'quiz_questions' not in st.session_state:
-        st.session_state.quiz_questions = []
-    if 'current_question' not in st.session_state:
-        st.session_state.current_question = 0
-    if 'user_answers' not in st.session_state:
-        st.session_state.user_answers = {}
-    if 'quiz_submitted' not in st.session_state:
-        st.session_state.quiz_submitted = False
-    if 'quiz_score' not in st.session_state:
-        st.session_state.quiz_score = 0
-    if 'quiz_completed' not in st.session_state:
-        st.session_state.quiz_completed = False
-    if 'quiz_topic' not in st.session_state:
-        st.session_state.quiz_topic = ""
-    if 'last_api_call' not in st.session_state:
-        st.session_state.last_api_call = 0
+    """Initialize all session state variables with better structure"""
+    defaults = {
+        # Chat state
+        'messages': [{"role": "assistant", "content": "🎖️ Welcome to NCC AI Assistant Pro! I'm here to help you with all aspects of NCC training. How can I assist you today?"}],
+        'chat_sessions': {},
+        'current_session_id': 'default',
+        
+        # Quiz state
+        'quiz_questions': [],
+        'current_question': 0,
+        'user_answers': {},
+        'quiz_submitted': False,
+        'quiz_score': 0,
+        'quiz_completed': False,
+        'quiz_topic': "",
+        'quiz_history': [],
+        
+        # Practice test state
+        'practice_test_active': False,
+        'practice_test_questions': [],
+        'practice_test_answers': {},
+        'practice_test_time_limit': 30,
+        'practice_test_start_time': None,
+        
+        # Study materials state
+        'bookmarks': [],
+        'study_progress': {},
+        'notes': {},
+        
+        # API management
+        'last_api_call': None,
+        'api_call_count': 0,
+        'daily_quota_used': 0,
+        'daily_quota_reset': datetime.now().date(),
+        
+        # User preferences
+        'theme': 'light',
+        'difficulty_level': 'intermediate',
+        'preferred_topics': [],
+        
+        # Statistics
+        'total_questions_answered': 0,
+        'correct_answers': 0,
+        'study_time': 0,
+        'certificates_studied': [],
+    }
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-def can_make_api_call() -> tuple[bool, str]:
-    """Check if we can make an API call based on rate limiting"""
-    if not st.session_state.last_api_call:
-        return True, ""
-
-    time_since_last = datetime.now() - st.session_state.last_api_call
-    cooldown_minutes = 2  # Reduced cooldown for better UX
-
-    if time_since_last < timedelta(minutes=cooldown_minutes):
-        remaining = cooldown_minutes - (time_since_last.seconds // 60)
-        return False, f"Please wait {remaining} more minute(s) before generating another quiz."
-
+def check_api_quota():
+    """Enhanced API quota management"""
+    today = datetime.now().date()
+    
+    # Reset daily quota if it's a new day
+    if st.session_state.daily_quota_reset != today:
+        st.session_state.daily_quota_used = 0
+        st.session_state.api_call_count = 0
+        st.session_state.daily_quota_reset = today
+    
+    # Check if quota exceeded (example: 50 calls per day for free tier)
+    daily_limit = 50
+    if st.session_state.daily_quota_used >= daily_limit:
+        return False, f"Daily API limit reached ({daily_limit} calls). Resets at midnight."
+    
     return True, ""
 
-def display_chat_interface(model, model_error, get_response_func, st_session_state):
-    """Display the chat interface"""
-    st.header("💬 NCC AI Assistant")
+def display_dashboard():
+    """Display a comprehensive dashboard"""
+    st.markdown('<div class="main-header"><h1>🎖️ NCC AI Assistant Pro</h1><p>Your Complete NCC Study Companion</p></div>', unsafe_allow_html=True)
     
-    # Initialize chat history if not exists
-    if "messages" not in st.session_state:
-        st.session_state.messages = [
-            {"role": "assistant", "content": "Hello! I'm your NCC AI Assistant. How can I help you with NCC today?"}
-        ]
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-    
-    # Chat input
-    if prompt := st.chat_input("Ask me anything about NCC..."):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        
-        # Display assistant response
-        with st.chat_message("assistant"):
-            response = get_response_func(model, model_error, prompt)
-            st.markdown(response)
-        
-        # Add assistant response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response})
-
-def display_quiz_interface(model, model_error, generate_quiz_func, parse_quiz_func, st_session_state):
-    """Display the quiz interface"""
-    st.header("🎯 NCC Knowledge Quiz")
-    st.write("Test your knowledge with AI-generated NCC quizzes!")
-
-    # Quiz creation section
-    if not st.session_state.get('quiz_questions') or st.session_state.get('quiz_completed', False):
-        display_quiz_creation(model, model_error, generate_quiz_func, parse_quiz_func, st_session_state)
-    else:
-        display_active_quiz(model, model_error, generate_quiz_func, parse_quiz_func, st_session_state)
-
-def display_quiz_creation(model, model_error, generate_quiz_func, parse_quiz_func, st_session_state):
-    """Display quiz creation form"""
-    st.subheader("📝 Create New Quiz")
-    
-    # Predefined topics
-    col1, col2 = st.columns([2, 1])
+    # Statistics row
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        topic_options = [
-            "Custom Topic",
-            "Drill Commands and Procedures",
-            "Map Reading and Navigation",
-            "First Aid and Medical Training", 
-            "Weapon Training and Safety",
-            "NCC History and Organization",
-            "Leadership and Discipline",
-            "Adventure Activities",
-            "Military Knowledge",
-            "Field Craft and Camping"
-        ]
-        
-        selected_topic = st.selectbox("Choose a topic:", topic_options)
-        
-        if selected_topic == "Custom Topic":
-            quiz_topic = st.text_input("Enter your custom topic:", 
-                                     placeholder="e.g., Signal Communications, Parade Commands")
-        else:
-            quiz_topic = selected_topic
+        st.markdown(f"""
+        <div class="stat-box">
+            <h3>{st.session_state.total_questions_answered}</h3>
+            <p>Questions Answered</p>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col2:
-        num_questions = st.number_input("Number of Questions", 
-                                      min_value=3, max_value=10, value=5)
+        accuracy = (st.session_state.correct_answers / max(st.session_state.total_questions_answered, 1)) * 100
+        st.markdown(f"""
+        <div class="stat-box">
+            <h3>{accuracy:.1f}%</h3>
+            <p>Accuracy Rate</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # Generate button
-    if st.button("🚀 Generate Quiz", type="primary", disabled=not quiz_topic):
-        if quiz_topic.strip():
-            questions = generate_quiz_func(quiz_topic.strip(), num_questions)
-            if questions:
-                st_session_state.quiz_questions = questions
-                st_session_state.quiz_topic = quiz_topic.strip()
-                st_session_state.current_question = 0
-                st_session_state.user_answers = {}
-                st_session_state.quiz_submitted = False
-                st_session_state.quiz_completed = False
-                st_session_state.quiz_score = 0
-                st.rerun()
-        else:
-            st.warning("Please enter a quiz topic.")
+    with col3:
+        st.markdown(f"""
+        <div class="stat-box">
+            <h3>{len(st.session_state.quiz_history)}</h3>
+            <p>Quizzes Taken</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # Show rate limiting info
-    if 'last_api_call' in st_session_state and st_session_state.last_api_call:
-        time_since_last = datetime.now() - st_session_state.last_api_call
-        if time_since_last < timedelta(minutes=2):
-            remaining = 2 - (time_since_last.seconds // 60)
-            st.info(f"ℹ️ Quiz generation available in {remaining} minute(s)")
-
-def display_active_quiz(model, model_error, generate_quiz_func, parse_quiz_func, st_session_state):
-    """Display the active quiz"""
-    # Check if quiz is submitted and show results if true
-    if st_session_state.get('quiz_submitted', False):
-        show_current_answer_result(None, None, st_session_state)
-        return
-        
-    if not st_session_state.get('quiz_questions'):
-        st.warning("No quiz questions available. Please generate a quiz first.")
-        return
-        
-    questions = st_session_state.quiz_questions
-    current_idx = st_session_state.get('current_question', 0)
+    with col4:
+        study_hours = st.session_state.study_time // 3600
+        st.markdown(f"""
+        <div class="stat-box">
+            <h3>{study_hours}h</h3>
+            <p>Study Time</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # Ensure current index is within bounds
-    if current_idx >= len(questions):
-        current_idx = 0
-        st_session_state.current_question = 0
-    
-    # Initialize answer in session state if not exists
-    answer_key = f"answer_{current_idx}"
-    if answer_key not in st.session_state:
-        st.session_state[answer_key] = st.session_state.user_answers.get(str(current_idx), "")
-    
-    # Ensure the current question has the required structure
-    current_question = questions[current_idx]
-    if not isinstance(current_question, dict) or 'options' not in current_question:
-        st.error("Invalid question format. Please generate a new quiz.")
-        if st.button("Generate New Quiz"):
-            reset_quiz(st_session_state)
-            st.rerun()
-        return
-
-    # Quiz header
-    st.subheader(f"📚 Quiz: {st_session_state.get('quiz_topic', 'General Knowledge')}")
-    
-    # Progress bar
-    progress = (current_idx + 1) / len(questions)
-    st.progress(progress)
-    st.write(f"Question {current_idx + 1} of {len(questions)}")
-    
-    # Question display
-    st.markdown(f"### {current_question.get('question', 'Question not available')}")
-    
-    # Get current answer if it exists
-    current_answer = st.session_state[answer_key].upper()
-    
-    # Ensure options exist and are in the correct format
-    options = current_question.get('options', {})
-    option_keys = [k for k in ['A', 'B', 'C', 'D'] if k in options]
-    
-    if not option_keys:
-        st.error("No valid options found for this question.")
-        return
-    
-    # Use a form for the current question
-    with st.form(key=f'question_form_{current_idx}'):
-        # Answer options
-        selected_answer = st.radio(
-            "Choose your answer:",
-            options=option_keys,
-            format_func=lambda x: f"{x}) {options.get(x, '')}",
-            key=answer_key,
-            index=option_keys.index(current_answer) if current_answer in option_keys else 0
-        )
-        
-        # Navigation buttons
-        col1, col2 = st.columns([1, 2])
-        
-        with col1:
-            if st.form_submit_button("⏮️ Previous", disabled=current_idx == 0):
-                st_session_state.user_answers[str(current_idx)] = selected_answer
-                st_session_state.current_question = max(0, current_idx - 1)
-                st.rerun()
-        
-        with col2:
-            if current_idx < len(questions) - 1:
-                if st.form_submit_button("Next ⏭️"):
-                    st_session_state.user_answers[str(current_idx)] = selected_answer
-                    st_session_state.current_question = current_idx + 1
-                    st.rerun()
-            else:
-                if st.form_submit_button("✅ Submit Quiz"):
-                    st_session_state.user_answers[str(current_idx)] = selected_answer
-                    st_session_state.quiz_submitted = True
-                    st.rerun()
-    
-    # Add a new quiz button at the bottom
-    if st.button("🔄 New Quiz", key="new_quiz_btn"):
-        reset_quiz(st_session_state)
-        st.rerun()
-
-def calculate_and_show_results(st_session_state):
-    """Calculate quiz results and display them"""
-    questions = st_session_state.quiz_questions
-    user_answers = st_session_state.user_answers
-    
-    correct_count = 0
-    total_questions = len(questions)
-    
-    st.session_state.quiz_submitted = True
-    st.session_state.quiz_completed = True
-    
-    # Calculate score
-    for i, question in enumerate(questions):
-        if user_answers.get(str(i)) == question['answer']:
-            correct_count += 1
-    
-    score_percentage = (correct_count / total_questions) * 100
-    st.session_state.quiz_score = score_percentage
-    
-    # Store results in session state for display
-    st.session_state.quiz_results = {
-        'correct_count': correct_count,
-        'total_questions': total_questions,
-        'score_percentage': score_percentage,
-        'questions': questions,
-        'user_answers': user_answers
-    }
-
-def show_current_answer_result(question: Dict, user_answer: str, st_session_state):
-    """Show result for current question or quiz results"""
-    if not hasattr(st_session_state, 'quiz_results'):
-        # Show single question result
-        if not user_answer:
-            return
-        
-        st.markdown("---")
-        
-        # Create columns for better layout
-        col1, col2 = st.columns([1, 20])
-        
-        correct_answer = question['answer']
-        is_correct = user_answer.lower() == correct_answer.lower()
-        
-        with col1:
-            if is_correct:
-                st.success("✅")
-            else:
-                st.error("❌")
-        
-        with col2:
-            if is_correct:
-                st.success("**Correct!**")
-            else:
-                st.error(f"**Incorrect.** The correct answer is {correct_answer}) {question['options'][correct_answer]}")
-        
-        if question.get('explanation'):
-            with st.expander("💡 Explanation", expanded=True):
-                st.info(question['explanation'])
+    # Recent activity
+    st.subheader("📊 Recent Activity")
+    if st.session_state.quiz_history:
+        recent_quiz = st.session_state.quiz_history[-1]
+        st.info(f"Last quiz: {recent_quiz['topic']} - Score: {recent_quiz['score']:.1f}% on {recent_quiz['date']}")
     else:
-        # Show full quiz results
-        results = st_session_state.quiz_results
-        
-        # Display overall results
-        st.markdown("---")
-        st.header("🎉 Quiz Results")
-        
-        # Score display with color coding
-        if results['score_percentage'] >= 80:
-            st.success(f"🏆 Excellent! You scored {results['correct_count']}/{results['total_questions']} ({results['score_percentage']:.1f}%)")
-        elif results['score_percentage'] >= 60:
-            st.warning(f"👍 Good job! You scored {results['correct_count']}/{results['total_questions']} ({results['score_percentage']:.1f}%)")
-        else:
-            st.error(f"📚 Keep studying! You scored {results['correct_count']}/{results['total_questions']} ({results['score_percentage']:.1f}%)")
-        
-        # Detailed results
-        with st.expander("📊 View Detailed Results", expanded=True):
-            for i, question in enumerate(results['questions']):
-                user_answer = results['user_answers'].get(str(i), "No answer")
-                correct_answer = question['answer']
-                is_correct = user_answer.lower() == correct_answer.lower()
-                
-                st.markdown(f"**Question {i+1}:** {question['question']}")
-                
-                if is_correct:
-                    st.success(f"✅ Your answer: {user_answer}) {question['options'][user_answer]}")
-                else:
-                    st.error(f"❌ Your answer: {user_answer}) {question['options'].get(user_answer, 'No answer')}")
-                    st.info(f"✅ Correct answer: {correct_answer}) {question['options'][correct_answer]}")
-                
-                if question.get('explanation'):
-                    st.info(f"💡 **Explanation:** {question['explanation']}")
-                
-                st.markdown("---")
+        st.info("No recent quiz activity. Start a quiz to track your progress!")
+    
+    # Quick actions
+    st.subheader("🚀 Quick Actions")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        if st.button("📚 Start Study Session", use_container_width=True):
+            st.session_state.page = "📚 Study Materials"
+            st.rerun()
+    
+    with col2:
+        if st.button("🎯 Take Quiz", use_container_width=True):
+            st.session_state.page = "🎯 Knowledge Quiz"
+            st.rerun()
+    
+    with col3:
+        if st.button("📝 Practice Test", use_container_width=True):
+            st.session_state.page = "📝 Practice Tests"
+            st.rerun()
+    
+    with col4:
+        if st.button("💬 Ask Assistant", use_container_width=True):
+            st.session_state.page = "💬 Chat Assistant"
+            st.rerun()
 
-def reset_quiz(st_session_state):
-    """Reset quiz state"""
-    st_session_state.quiz_questions = []
-    st_session_state.current_question = 0
-    st.session_state.user_answers = {}
-    st.session_state.quiz_submitted = False
-    st.session_state.quiz_score = 0
-    st.session_state.quiz_completed = False
-    st.session_state.quiz_topic = ""
+def display_settings():
+    """Display user settings and preferences"""
+    st.header("⚙️ Settings & Preferences")
+    
+    # User preferences
+    st.subheader("👤 User Preferences")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        difficulty = st.selectbox(
+            "Difficulty Level",
+            ["beginner", "intermediate", "advanced"],
+            index=["beginner", "intermediate", "advanced"].index(st.session_state.difficulty_level)
+        )
+        st.session_state.difficulty_level = difficulty
+        
+        certificate_focus = st.multiselect(
+            "Certificate Focus",
+            ["A Certificate", "B Certificate", "C Certificate"],
+            default=st.session_state.certificates_studied
+        )
+        st.session_state.certificates_studied = certificate_focus
+    
+    with col2:
+        preferred_topics = st.multiselect(
+            "Preferred Study Topics",
+            [
+                "Drill Commands", "Map Reading", "First Aid", "Weapon Training",
+                "Leadership", "Military History", "Adventure Activities",
+                "Disaster Management", "Social Service", "Environment"
+            ],
+            default=st.session_state.preferred_topics
+        )
+        st.session_state.preferred_topics = preferred_topics
+    
+    # API Management
+    st.subheader("🔧 API Management")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.metric("Daily API Calls Used", st.session_state.daily_quota_used, delta=f"out of 50")
+    
+    with col2:
+        if st.button("Reset API Counter", type="secondary"):
+            st.session_state.daily_quota_used = 0
+            st.session_state.api_call_count = 0
+            st.success("API counter reset!")
+    
+    # Data Management
+    st.subheader("💾 Data Management")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("📥 Export Chat History"):
+            chat_data = export_chat_history(st.session_state.messages)
+            st.download_button(
+                "Download Chat History",
+                chat_data,
+                "ncc_chat_history.json",
+                "application/json"
+            )
+    
+    with col2:
+        uploaded_file = st.file_uploader("📤 Import Chat History", type="json")
+        if uploaded_file:
+            imported_messages = import_chat_history(uploaded_file)
+            if imported_messages:
+                st.session_state.messages = imported_messages
+                st.success("Chat history imported successfully!")
+    
+    with col3:
+        if st.button("🗑️ Clear All Data", type="secondary"):
+            if st.checkbox("I understand this will delete all my progress"):
+                initialize_session_state()
+                st.success("All data cleared!")
 
 def main():
-    """Main application function"""
-    global model, model_error
-    
-    # Initialize the Gemini model
-    model, model_error = setup_gemini()
+    """Enhanced main application function"""
+    # Load custom CSS
+    load_custom_css()
     
     # Initialize session state
     initialize_session_state()
+    
+    # Setup Gemini model
+    model, model_error = setup_gemini_cached()
+    
+    # Check API quota
+    quota_ok, quota_message = check_api_quota()
+    
+    # Sidebar navigation
+    with st.sidebar:
+        st.title("🧭 Navigation")
+        
+        # Navigation options
+        page_options = [
+            "🏠 Dashboard",
+            "💬 Chat Assistant", 
+            "🎯 Knowledge Quiz",
+            "📝 Practice Tests",
+            "📚 Study Materials",
+            "⚙️ Settings"
+        ]
+        
+        # Get current page from session state or default
+        if 'page' not in st.session_state:
+            st.session_state.page = "🏠 Dashboard"
+        
+        current_index = page_options.index(st.session_state.page) if st.session_state.page in page_options else 0
+        
+        page = st.radio(
+            "Choose a section:",
+            page_options,
+            index=current_index,
+            key="nav_radio"
+        )
+        
+        # Update session state
+        st.session_state.page = page
+        
+        # API Status
+        st.markdown("---")
+        st.subheader("📡 API Status")
+        if model:
+            st.success("✅ Connected")
+        else:
+            st.error("❌ Connection Error")
+            
+        if not quota_ok:
+            st.warning(quota_message)
+        
+        # Quick stats
+        st.markdown("---")
+        st.subheader("📊 Quick Stats")
+        st.metric("Questions Today", st.session_state.api_call_count)
+        st.metric("Total Study Sessions", len(st.session_state.quiz_history))
+        
+        # Tips
+        st.markdown("---")
+        st.subheader("💡 Study Tips")
+        tips = [
+            "Review drill commands daily",
+            "Practice map reading regularly", 
+            "Study first aid procedures",
+            "Understand leadership principles",
+            "Learn military terminology"
+        ]
+        tip_of_day = tips[datetime.now().day % len(tips)]
+        st.info(f"💡 {tip_of_day}")
     
     # Error handling for model initialization
     if not model:
@@ -390,59 +409,45 @@ def main():
         2. Create a `.env` file in your project directory
         3. Add: `GEMINI_API_KEY=your_api_key_here`
         4. Restart the application
+        
+        **Alternative Setup:**
+        - Set the environment variable directly: `export GEMINI_API_KEY=your_key`
+        - Use Streamlit secrets: Add to `.streamlit/secrets.toml`
         """)
         return
     
-    # Header
-    st.title("🎖️ NCC AI Assistant")
-    st.markdown("*Your comprehensive AI-powered NCC study companion*")
-    
-    # Navigation
-    st.sidebar.title("🧭 Navigation")
-    st.sidebar.markdown("---")
-    
-    # Add a unique key to the radio widget
-    page = st.sidebar.radio(
-        "Choose a section:",
-        ["💬 Chat Assistant", "🎯 Knowledge Quiz"],
-        key="nav_radio",
-        label_visibility="collapsed"
-    )
-    
-    # Page routing with required arguments
-    if page == "💬 Chat Assistant":
-        from utils import get_ncc_response
-        display_chat_interface(
-            model=model,
-            model_error=model_error,
-            get_response_func=get_ncc_response,
-            st_session_state=st.session_state
-        )
-    else:
-        from utils import generate_quiz_questions, parse_quiz_response
-        display_quiz_interface(
-            model=model,
-            model_error=model_error,
-            generate_quiz_func=lambda topic, num: generate_quiz_questions(model, model_error, st.session_state, topic, num),
-            parse_quiz_func=parse_quiz_response,
-            st_session_state=st.session_state
-        )
-    
-    # Sidebar info
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 📖 About NCC Assistant")
-    st.sidebar.markdown("""
-    This AI assistant helps NCC cadets with:
-    - **Study Materials**: Get detailed explanations
-    - **Practice Quizzes**: Test your knowledge  
-    - **Quick Answers**: Ask any NCC-related questions
-    - **Exam Preparation**: Comprehensive coverage
-    """)
+    # Page routing
+    if page == "🏠 Dashboard":
+        display_dashboard()
+    elif page == "💬 Chat Assistant":
+        display_chat_interface(model, model_error, get_ncc_response, st.session_state)
+    elif page == "🎯 Knowledge Quiz":
+        display_quiz_interface(model, model_error, generate_quiz_questions, parse_quiz_response, st.session_state)
+    elif page == "📝 Practice Tests":
+        display_practice_tests(model, model_error, st.session_state)
+    elif page == "📚 Study Materials":
+        display_study_materials(st.session_state)
+    elif page == "⚙️ Settings":
+        display_settings()
     
     # Footer
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("*Made with ❤️ by : Jawwad*")
-    st.sidebar.markdown("*Developed for NCC Cadets 🎖️*")
+    st.markdown("---")
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("""
+        <div style='text-align: center; color: #666; padding: 1rem;'>
+            <p>🎖️ <strong>NCC AI Assistant Pro</strong> - Made with ❤️ for NCC Cadets</p>
+            <p><small>Version 2.0 | Enhanced with AI-powered features</small></p>
+        </div>
+        """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        st.error(f"Application Error: {str(e)}")
+        logger.error(f"Application error: {e}", exc_info=True)
+        
+        # Show debug info in development
+        if os.getenv("DEBUG", "false").lower() == "true":
+            st.exception(e)
